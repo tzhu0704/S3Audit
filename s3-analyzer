@@ -1,0 +1,84 @@
+#!/bin/bash
+#
+# S3 数据丢失分析工具 - Shell 封装脚本
+#
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_SCRIPT="$SCRIPT_DIR/s3_deletion_analyzer.py"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+show_help() {
+    cat << EOF
+${BLUE}S3 数据丢失分析工具${NC}
+
+${GREEN}用法:${NC}
+    s3-analyzer -b BUCKET [选项]
+
+${GREEN}必需参数:${NC}
+    -b, --bucket BUCKET        S3 bucket 名称
+
+${GREEN}可选参数:${NC}
+    -r, --region REGION        AWS 区域 (默认: us-east-1)
+    -s, --skip-listing         跳过对象列表统计
+    -h, --help                 显示帮助信息
+
+${GREEN}示例:${NC}
+    s3-analyzer -b my-bucket
+    s3-analyzer -b my-bucket -r us-west-2
+    s3-analyzer -b large-bucket --skip-listing
+
+EOF
+}
+
+check_dependencies() {
+    if ! command -v python3 &> /dev/null; then
+        echo -e "${RED}错误: 未找到 python3${NC}"
+        exit 1
+    fi
+    if ! python3 -c "import boto3" 2>/dev/null; then
+        echo -e "${RED}错误: 未找到 boto3${NC}"
+        exit 1
+    fi
+}
+
+BUCKET=""
+REGION="us-east-1"
+SKIP_LISTING=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -b|--bucket) BUCKET="$2"; shift 2 ;;
+        -r|--region) REGION="$2"; shift 2 ;;
+        -s|--skip-listing) SKIP_LISTING="--skip-listing"; shift ;;
+        -h|--help) show_help; exit 0 ;;
+        *) echo -e "${RED}错误: 未知参数 '$1'${NC}"; exit 1 ;;
+    esac
+done
+
+if [ -z "$BUCKET" ]; then
+    echo -e "${RED}错误: 缺少 --bucket 参数${NC}"
+    show_help
+    exit 1
+fi
+
+check_dependencies
+
+echo -e "${BLUE}S3 数据丢失分析工具${NC}"
+echo -e "${GREEN}Bucket:${NC} $BUCKET"
+echo -e "${GREEN}Region:${NC} $REGION"
+echo ""
+
+python3 "$PYTHON_SCRIPT" --bucket "$BUCKET" --region "$REGION" $SKIP_LISTING
+
+if [ $? -eq 0 ]; then
+    echo ""
+    echo -e "${GREEN}✓ 分析完成!${NC}"
+    echo -e "${BLUE}报告位置:${NC} $(pwd)/logs/"
+fi
