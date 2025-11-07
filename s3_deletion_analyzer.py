@@ -21,8 +21,9 @@ class S3DeletionAnalyzer:
         self.cloudtrail = boto3.client('cloudtrail', region_name=region)
         self.findings = []
         
-        # 创建 logs 目录
-        self.logs_dir = os.path.join(os.getcwd(), 'logs')
+        # 创建 logs 目录(在脚本所在目录)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.logs_dir = os.path.join(script_dir, 'logs')
         os.makedirs(self.logs_dir, exist_ok=True)
         
     def analyze(self):
