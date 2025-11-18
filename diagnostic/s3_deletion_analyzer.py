@@ -19,10 +19,12 @@ class S3DeletionAnalyzer:
         self.s3_client = boto3.client('s3', region_name=region)
         self.cloudwatch = boto3.client('cloudwatch', region_name=region)
         self.cloudtrail = boto3.client('cloudtrail', region_name=region)
+        self.ce_client = boto3.client('ce', region_name='us-east-1')  # Cost Explorer 只在 us-east-1
         self.findings = []
         
-        # 创建 logs 目录
-        self.logs_dir = os.path.join(os.getcwd(), 'logs')
+        # 创建 logs 目录(在脚本所在目录)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.logs_dir = os.path.join(script_dir, 'logs')
         os.makedirs(self.logs_dir, exist_ok=True)
         
     def analyze(self):
@@ -53,16 +55,20 @@ class S3DeletionAnalyzer:
         print("[5/7] 检查 Bucket 策略...")
         self._check_bucket_policy()
         
-        # 6. 当前对象统计
+        # 6. 成本分析
+        print("[6/8] 分析 S3 成本变化...")
+        self._analyze_costs()
+        
+        # 7. 当前对象统计
         if not self.skip_object_listing:
-            print("[6/7] 统计当前对象...")
+            print("[7/8] 统计当前对象...")
             self._analyze_current_objects()
         else:
-            print("[6/7] 跳过对象统计(使用 --skip-listing 参数)...")
+            print("[7/8] 跳过对象统计(使用 --skip-listing 参数)...")
             self.current_stats = {'skipped': True}
         
-        # 7. 生成报告
-        print("[7/7] 生成分析报告...\n")
+        # 8. 生成报告
+        print("[8/8] 生成分析报告...\n")
         self._generate_report()
         
     def _analyze_cloudwatch_metrics(self):
@@ -171,16 +177,36 @@ class S3DeletionAnalyzer:
             status = versioning.get('Status', 'Disabled')
             
             if status == 'Enabled':
-                # 列出删除标记和版本
+                # 列出删除标记和版本（使用分页器获取所有数据）
                 try:
-                    response = self.s3_client.list_object_versions(
+                    # 计算3个月前的时间
+                    three_months_ago = datetime.utcnow() - timedelta(days=90)
+                    
+                    all_delete_markers = []
+                    all_versions = []
+                    
+                    # 使用分页器获取所有版本
+                    paginator = self.s3_client.get_paginator('list_object_versions')
+                    page_iterator = paginator.paginate(
                         Bucket=self.bucket_name,
-                        MaxKeys=1000
+                        PaginationConfig={'PageSize': 1000}
                     )
                     
-                    delete_markers = [dm for dm in response.get('DeleteMarkers', []) 
-                                     if dm.get('IsLatest', False)]
-                    versions = response.get('Versions', [])
+                    for page in page_iterator:
+                        all_delete_markers.extend(page.get('DeleteMarkers', []))
+                        all_versions.extend(page.get('Versions', []))
+                    
+                    # 按时间过滤：只保留最近3个月的删除标记
+                    delete_markers = [
+                        dm for dm in all_delete_markers 
+                        if dm.get('IsLatest', False) and dm['LastModified'].replace(tzinfo=None) >= three_months_ago
+                    ]
+                    
+                    # 按时间过滤版本
+                    versions = [
+                        v for v in all_versions
+                        if v['LastModified'].replace(tzinfo=None) >= three_months_ago
+                    ]
                     
                     # 统计版本信息
                     total_versions = len(versions)
@@ -202,15 +228,17 @@ class S3DeletionAnalyzer:
                     # 找出有多个非当前版本的对象(可能被多次修改/删除)
                     for key, vers in noncurrent_by_key.items():
                         if len(vers) > 0:
+                            # 按时间排序，最新的在前
+                            vers_sorted = sorted(vers, key=lambda x: x['last_modified'], reverse=True)
                             noncurrent_analysis.append({
                                 'key': key,
                                 'noncurrent_count': len(vers),
-                                'latest_noncurrent': vers[0]['last_modified'].strftime('%Y-%m-%d %H:%M:%S'),
+                                'latest_noncurrent': vers_sorted[0]['last_modified'].strftime('%Y-%m-%d %H:%M:%S'),
                                 'total_size': sum(v['size'] for v in vers)
                             })
                     
-                    # 按非当前版本数量排序
-                    noncurrent_analysis.sort(key=lambda x: x['noncurrent_count'], reverse=True)
+                    # 按最近修改时间排序，最新的在前
+                    noncurrent_analysis.sort(key=lambda x: x['latest_noncurrent'], reverse=True)
                     
                     version_info = {
                         'status': 'Enabled',
@@ -220,23 +248,26 @@ class S3DeletionAnalyzer:
                         'objects_with_noncurrent': len(noncurrent_analysis)
                     }
                     
-                    # 保存供报告使用
+                    # 保存供报告使用，按时间排序
+                    delete_markers_sorted = sorted(delete_markers, key=lambda x: x['LastModified'], reverse=True)
                     self.version_analysis = {
                         'delete_markers': [{
                             'key': dm['Key'],
                             'last_modified': dm['LastModified'].strftime('%Y-%m-%d %H:%M:%S'),
                             'version_id': dm['VersionId']
-                        } for dm in delete_markers],
-                        'noncurrent_analysis': noncurrent_analysis
+                        } for dm in delete_markers_sorted],
+                        'noncurrent_analysis': noncurrent_analysis,
+                        'time_range': f'最近90天 ({three_months_ago.strftime("%Y-%m-%d")} 至 {datetime.utcnow().strftime("%Y-%m-%d")})'
                     }
                     
                     if delete_markers:
                         self.findings.append({
                             'severity': 'MEDIUM',
                             'category': '版本控制',
-                            'title': f'发现 {len(delete_markers)} 个删除标记',
+                            'title': f'最近90天发现 {len(delete_markers)} 个删除标记',
                             'details': {
-                                'message': '这些对象被标记为删除,但可以恢复',
+                                'message': f'这些对象在最近90天内被标记为删除,但可以恢复',
+                                'time_range': f'{three_months_ago.strftime("%Y-%m-%d")} 至 {datetime.utcnow().strftime("%Y-%m-%d")}',
                                 'version_info': version_info
                             }
                         })
@@ -245,9 +276,10 @@ class S3DeletionAnalyzer:
                         self.findings.append({
                             'severity': 'INFO',
                             'category': '版本控制',
-                            'title': f'发现 {len(noncurrent_analysis)} 个对象有非当前版本',
+                            'title': f'最近90天发现 {len(noncurrent_analysis)} 个对象有非当前版本',
                             'details': {
-                                'message': f'共 {len(noncurrent_versions)} 个非当前版本,可能包含被覆盖或删除的数据',
+                                'message': f'最近90天内共 {len(noncurrent_versions)} 个非当前版本,可能包含被覆盖或删除的数据',
+                                'time_range': f'{three_months_ago.strftime("%Y-%m-%d")} 至 {datetime.utcnow().strftime("%Y-%m-%d")}',
                                 'version_info': version_info
                             }
                         })
@@ -454,6 +486,116 @@ class S3DeletionAnalyzer:
             # NoSuchBucketPolicy 或其他错误都静默处理
             pass
     
+    def _analyze_costs(self):
+        """分析 S3 成本变化"""
+        try:
+            end_date = datetime.utcnow().date()
+            start_date = end_date - timedelta(days=90)
+            
+            # 获取该区域 S3 每日成本（按用量类型分组）
+            response = self.ce_client.get_cost_and_usage(
+                TimePeriod={
+                    'Start': start_date.strftime('%Y-%m-%d'),
+                    'End': end_date.strftime('%Y-%m-%d')
+                },
+                Granularity='DAILY',
+                Metrics=['UnblendedCost'],
+                Filter={
+                    'Dimensions': {
+                        'Key': 'SERVICE',
+                        'Values': ['Amazon Simple Storage Service']
+                    }
+                },
+                GroupBy=[
+                    {'Type': 'DIMENSION', 'Key': 'USAGE_TYPE'}
+                ]
+            )
+            
+            # 分析成本数据，过滤出该区域的成本
+            cost_data = []
+            region_prefix = self.region.replace('-', '')
+            
+            for result in response['ResultsByTime']:
+                date = result['TimePeriod']['Start']
+                
+                # 按用量类型分组，过滤出该区域的成本
+                usage_costs = {}
+                total_cost = 0
+                
+                for group in result.get('Groups', []):
+                    usage_type = group['Keys'][0]
+                    cost = float(group['Metrics']['UnblendedCost']['Amount'])
+                    
+                    # 过滤出当前区域的用量类型
+                    # 例如: USE1-TimedStorage-ByteHrs (北弗吉尼亚), APN1-TimedStorage-ByteHrs (东京)
+                    if cost > 0:
+                        # 提取区域代码
+                        usage_region = usage_type.split('-')[0] if '-' in usage_type else ''
+                        
+                        # 如果区域匹配或是全局服务，则计入
+                        if (region_prefix.upper() in usage_region.upper() or 
+                            usage_region in ['', 'Global', 'Worldwide']):
+                            usage_costs[usage_type] = cost
+                            total_cost += cost
+                
+                cost_data.append({
+                    'date': date,
+                    'total_cost': total_cost,
+                    'usage_costs': usage_costs
+                })
+            
+            # 分析成本变化
+            if len(cost_data) > 1:
+                cost_changes = []
+                for i in range(1, len(cost_data)):
+                    prev_cost = cost_data[i-1]['total_cost']
+                    curr_cost = cost_data[i]['total_cost']
+                    
+                    if prev_cost > 0:
+                        change = curr_cost - prev_cost
+                        change_pct = (change / prev_cost * 100)
+                        
+                        # 成本下降超过 20% 可能表示数据删除
+                        if change_pct < -20:
+                            cost_changes.append({
+                                'date': cost_data[i]['date'],
+                                'prev_cost': prev_cost,
+                                'curr_cost': curr_cost,
+                                'change': change,
+                                'change_pct': change_pct
+                            })
+                
+                if cost_changes:
+                    self.findings.append({
+                        'severity': 'HIGH',
+                        'category': '成本异常',
+                        'title': f'检测到 {len(cost_changes)} 次显著的成本下降',
+                        'details': cost_changes
+                    })
+            
+            # 保存成本数据供报告使用
+            self.cost_data = cost_data
+            
+        except Exception as e:
+            error_msg = str(e)
+            # 如果是权限问题或 Cost Explorer 未启用，静默处理
+            if 'AccessDenied' in error_msg or 'not subscribed' in error_msg:
+                self.cost_data = []
+                self.findings.append({
+                    'severity': 'INFO',
+                    'category': '成本分析',
+                    'title': '无法获取成本数据',
+                    'details': '需要 Cost Explorer 权限或启用 Cost Explorer'
+                })
+            else:
+                self.cost_data = []
+                self.findings.append({
+                    'severity': 'INFO',
+                    'category': '成本分析',
+                    'title': '无法获取成本数据',
+                    'details': error_msg
+                })
+    
     def _analyze_current_objects(self):
         """分析当前对象(优化版)"""
         try:
@@ -533,9 +675,12 @@ class S3DeletionAnalyzer:
         print(f"\n{'='*80}")
         print("当前 Bucket 状态")
         print(f"{'='*80}\n")
-        if hasattr(self, 'current_stats') and 'error' not in self.current_stats:
-            print(f"  对象总数: {self.current_stats['total_objects']:,}")
-            print(f"  总大小: {self.current_stats['total_size_gb']:.2f} GB")
+        if hasattr(self, 'current_stats'):
+            if self.current_stats.get('skipped'):
+                print("  ⏭️  跳过对象统计 (使用了 --skip-listing 参数)")
+            elif 'error' not in self.current_stats:
+                print(f"  对象总数: {self.current_stats.get('total_objects', 0):,}")
+                print(f"  总大小: {self.current_stats.get('total_size_gb', 0):.2f} GB")
         
         # 结论和建议
         print(f"\n{'='*80}")
@@ -572,7 +717,8 @@ class S3DeletionAnalyzer:
                              for d in getattr(self, 'size_data', [])],
                 'count_data': [{'timestamp': d['Timestamp'].isoformat(), 'count': d['Average']} 
                               for d in getattr(self, 'count_data', [])]
-            }
+            },
+            'cost_data': getattr(self, 'cost_data', [])
         }
         
         # 保存 JSON
@@ -664,6 +810,84 @@ class S3DeletionAnalyzer:
             
             f.write("---\n\n")
             
+            # 成本趋势分析
+            cost_data = report_data.get('cost_data', [])
+            if cost_data:
+                f.write("## 💰 S3 成本趋势 (过去 90 天)\n\n")
+                
+                f.write(f"⚠️ **注意**: 此成本数据为 {self.region} 区域的 S3 总成本，不仅限于单个 bucket。  \n")
+                f.write("可以通过成本变化趋势间接判断数据变化。\n\n")
+                
+                # 计算总成本和平均成本
+                total_cost = sum(d['total_cost'] for d in cost_data)
+                avg_cost = total_cost / len(cost_data) if cost_data else 0
+                
+                f.write(f"**总成本**: ${total_cost:.2f}  \n")
+                f.write(f"**平均每日成本**: ${avg_cost:.2f}  \n\n")
+                
+                # 成本趋势表格
+                f.write("### 每日成本明细\n\n")
+                f.write("| 日期 | 成本 ($) | 变化 | 主要用量类型 |\n")
+                f.write("|------|---------|------|------------|\n")
+                
+                for i, data in enumerate(cost_data[-30:]):  # 显示最近30天
+                    date = data['date']
+                    cost = data['total_cost']
+                    
+                    # 计算变化
+                    if i > 0:
+                        prev_cost = cost_data[i-1]['total_cost']
+                        if prev_cost > 0:
+                            change = cost - prev_cost
+                            change_pct = (change / prev_cost * 100)
+                            
+                            if abs(change_pct) > 5:
+                                change_str = f"{change:+.2f} ({change_pct:+.1f}%)"
+                                if change_pct < -20:
+                                    change_str = f"⚠️ {change_str}"
+                            else:
+                                change_str = "-"
+                        else:
+                            change_str = "-"
+                    else:
+                        change_str = "-"
+                    
+                    # 主要用量类型
+                    usage_costs = data.get('usage_costs', {})
+                    if usage_costs:
+                        top_usage = max(usage_costs.items(), key=lambda x: x[1])
+                        usage_str = f"{top_usage[0][:30]}... (${top_usage[1]:.2f})"
+                    else:
+                        usage_str = "-"
+                    
+                    f.write(f"| {date} | ${cost:.2f} | {change_str} | {usage_str} |\n")
+                
+                f.write("\n*显示最近 30 天数据*\n\n")
+                
+                # 用量类型汇总
+                f.write("### 用量类型汇总\n\n")
+                usage_summary = {}
+                for data in cost_data:
+                    for usage_type, cost in data.get('usage_costs', {}).items():
+                        if usage_type not in usage_summary:
+                            usage_summary[usage_type] = 0
+                        usage_summary[usage_type] += cost
+                
+                if usage_summary:
+                    sorted_usage = sorted(usage_summary.items(), key=lambda x: x[1], reverse=True)
+                    f.write("| 用量类型 | 总成本 ($) | 占比 |\n")
+                    f.write("|---------|-----------|------|\n")
+                    
+                    for usage_type, cost in sorted_usage[:10]:
+                        pct = (cost / total_cost * 100) if total_cost > 0 else 0
+                        f.write(f"| {usage_type} | ${cost:.2f} | {pct:.1f}% |\n")
+                    
+                    if len(sorted_usage) > 10:
+                        f.write(f"\n*显示前 10 项，共 {len(sorted_usage)} 项*\n")
+                    f.write("\n")
+                
+                f.write("---\n\n")
+            
             # CloudTrail 事件汇总
             if hasattr(self, 'cloudtrail_events'):
                 ct_events = self.cloudtrail_events
@@ -748,10 +972,8 @@ class S3DeletionAnalyzer:
                         f.write("⚠️ 这些对象被标记为删除,但可以恢复\n\n")
                         f.write("| 对象键 | 删除时间 | 版本 ID |\n")
                         f.write("|------|---------|----------|\n")
-                        for dm in va['delete_markers'][:20]:
+                        for dm in va['delete_markers']:
                             f.write(f"| `{dm['key']}` | {dm['last_modified']} | `{dm['version_id'][:16]}...` |\n")
-                        if len(va['delete_markers']) > 20:
-                            f.write(f"\n*显示前 20 个,共 {len(va['delete_markers'])} 个*\n")
                         f.write("\n")
                         
                         f.write("**恢复命令:**\n\n")
@@ -768,11 +990,9 @@ class S3DeletionAnalyzer:
                         
                         f.write("| 对象键 | 非当前版本数 | 最近修改时间 | 总大小 (MB) |\n")
                         f.write("|------|--------------|-------------|-------------|\n")
-                        for item in va['noncurrent_analysis'][:20]:
+                        for item in va['noncurrent_analysis']:
                             size_mb = item['total_size'] / (1024**2)
                             f.write(f"| `{item['key']}` | {item['noncurrent_count']} | {item['latest_noncurrent']} | {size_mb:.2f} |\n")
-                        if len(va['noncurrent_analysis']) > 20:
-                            f.write(f"\n*显示前 20 个,共 {len(va['noncurrent_analysis'])} 个*\n")
                         f.write("\n")
                         
                         f.write("**查看历史版本:**\n\n")
