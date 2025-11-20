@@ -84,7 +84,7 @@ for arg in "$@"; do
         BACKGROUND=true
     elif [ -z "$BUCKET_NAME" ] && [[ ! "$arg" =~ ^-- ]]; then
         BUCKET_NAME="$arg"
-        ARGS+=("$arg")
+        ARGS+=("--bucket" "$arg")
     else
         ARGS+=("$arg")
     fi

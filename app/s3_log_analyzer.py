@@ -71,13 +71,24 @@ def load_s3_logs(bucket, prefix, max_files=100, days_back=None):
     s3 = boto3.client('s3')
     
     try:
-        response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=max_files)
+        # 使用分页器支持超过 1000 个文件
+        paginator = s3.get_paginator('list_objects_v2')
+        page_iterator = paginator.paginate(
+            Bucket=bucket,
+            Prefix=prefix,
+            PaginationConfig={'MaxItems': max_files, 'PageSize': 1000}
+        )
         
-        if 'Contents' not in response:
+        # 收集所有文件
+        log_files = []
+        for page in page_iterator:
+            if 'Contents' in page:
+                log_files.extend([obj for obj in page['Contents'] if obj['Size'] > 0])
+        
+        if not log_files:
             return pd.DataFrame()
         
-        # 先按文件时间过滤
-        log_files = [obj for obj in response['Contents'] if obj['Size'] > 0]
+        # 按文件时间过滤
         
         if days_back:
             from datetime import datetime, timedelta, timezone
@@ -151,7 +162,7 @@ def main():
         }
         days_back = days_map[time_filter]
         
-        max_files = st.slider("最大日志文件数", 10, 2000, 200)
+        max_files = st.slider("最大日志文件数", 10, 20000, 200)
         
         load_button = st.button("🔄 加载日志", type="primary")
         
@@ -191,9 +202,7 @@ def main():
             max_date = df['time'].max().date()
             date_range = st.date_input(
                 "时间范围",
-                value=(min_date, max_date),
-                min_value=min_date,
-                max_value=max_date
+                value=(min_date, max_date)
             )
         else:
             date_range = None
