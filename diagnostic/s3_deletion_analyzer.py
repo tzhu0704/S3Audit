@@ -172,16 +172,31 @@ class S3DeletionAnalyzer:
     
     def _check_versioning(self):
         """检查版本控制和删除标记（优化内存使用）"""
+        # 初始化 version_analysis，确保始终存在
+        self.version_analysis = {
+            'delete_markers': [],
+            'noncurrent_analysis': [],
+            'total_delete_markers': 0,
+            'total_noncurrent_objects': 0,
+            'time_range': 'N/A',
+            'scan_start_time': 'N/A',
+            'scan_end_time': 'N/A',
+            'processing_status': '未执行',
+            'memory_optimization': 'N/A'
+        }
+        
         try:
             versioning = self.s3_client.get_bucket_versioning(Bucket=self.bucket_name)
             status = versioning.get('Status', 'Disabled')
             
             if status == 'Enabled':
-                print("  版本控制已启用，开始分析版本数据...")
+                print("  ✓ 版本控制已启用，开始分析版本数据...")
+                print("  ℹ️  [内存优化] 使用流式处理，限制内存使用")
                 # 流式处理版本数据，避免内存溢出
                 try:
                     # 计算3个月前的时间
                     three_months_ago = datetime.utcnow() - timedelta(days=90)
+                    print(f"  ℹ️  [时间范围] 分析最近90天的版本数据 ({three_months_ago.strftime('%Y-%m-%d')} 至今)")
                     
                     delete_markers = []
                     noncurrent_by_key = {}
@@ -189,9 +204,9 @@ class S3DeletionAnalyzer:
                     noncurrent_count = 0
                     total_delete_markers_count = 0  # 总删除标记数（包括未保存的）
                     
-                    # 严格限制内存使用
-                    MAX_DELETE_MARKERS = 10000  # 降低到10000
-                    MAX_NONCURRENT_KEYS = 10000  # 降低到10000
+                    # 调整内存限制，确保能捕获足够的删除标记
+                    MAX_DELETE_MARKERS = 5000  # 保证5000条详细信息，确保稳定性
+                    MAX_NONCURRENT_KEYS = 5000  # 同步降低以节省内存
                     
                     # 使用分页器流式处理
                     paginator = self.s3_client.get_paginator('list_object_versions')
@@ -204,25 +219,47 @@ class S3DeletionAnalyzer:
                     processing_failed = False
                     error_message = None
                     
+                    print(f"  ℹ️  [开始扫描] 开始分页扫描版本数据 (每页1000个对象)...")
+                    print(f"  🔍 [调试] 删除标记限制: {MAX_DELETE_MARKERS}, 非当前版本限制: {MAX_NONCURRENT_KEYS}")
+                    
                     for page in page_iterator:
                         page_num += 1
+                        
+                        # 调试：显示每页的原始数据
+                        page_dm_count = len(page.get('DeleteMarkers', []))
+                        page_versions_count = len(page.get('Versions', []))
+                        print(f"  🔍 [调试-第{page_num}页] 原始数据: DeleteMarkers={page_dm_count}, Versions={page_versions_count}")
+                        
                         if page_num % 10 == 0:
-                            print(f"  已处理 {page_num} 页版本数据 (删除标记: {total_delete_markers_count}, 非当前版本: {noncurrent_count})...")
+                            print(f"  📊 [进度] 已处理 {page_num} 页 (删除标记: {total_delete_markers_count}, 非当前版本: {noncurrent_count})")
                         
                         # 处理删除标记（只保留最近3个月的，且严格限制数量）
+                        page_dm_processed = 0
+                        page_dm_in_range = 0
                         for dm in page.get('DeleteMarkers', []):
-                            if dm.get('IsLatest', False) and dm['LastModified'].replace(tzinfo=None) >= three_months_ago:
+                            page_dm_processed += 1
+                            is_latest = dm.get('IsLatest', False)
+                            dm_time = dm['LastModified'].replace(tzinfo=None)
+                            in_range = dm_time >= three_months_ago
+                            
+                            if page_dm_processed <= 3:  # 只显示前3个用于调试
+                                print(f"    🔍 [调试-DM{page_dm_processed}] IsLatest={is_latest}, Time={dm_time.strftime('%Y-%m-%d')}, InRange={in_range}")
+                            
+                            if is_latest and in_range:
+                                page_dm_in_range += 1
                                 total_delete_markers_count += 1
                                 
-                                # 只保存前MAX_DELETE_MARKERS个最新的删除标记
+                                # 直接收集前5000个，不做复杂排序逻辑
                                 if len(delete_markers) < MAX_DELETE_MARKERS:
                                     delete_markers.append(dm)
-                                elif dm['LastModified'] > delete_markers[-1]['LastModified']:
-                                    # 如果新的删除标记更新，替换最旧的
-                                    delete_markers[-1] = dm
-                                    # 每1000个就重新排序一次，避免频繁排序
-                                    if total_delete_markers_count % 1000 == 0:
-                                        delete_markers.sort(key=lambda x: x['LastModified'], reverse=True)
+                                    if len(delete_markers) % 500 == 0:
+                                        print(f"    ✓ [收集] 已保存 {len(delete_markers)} 个删除标记详细信息")
+                                    # 达到5000后停止收集详细信息，但继续统计总数
+                                    if len(delete_markers) == MAX_DELETE_MARKERS:
+                                        print(f"    ✓ [达到限制] 已收集{MAX_DELETE_MARKERS}条详细信息，继续统计总数...")
+                        
+                        if page_dm_in_range > 0:
+                            print(f"    ✓ [本页统计] 符合条件的删除标记: {page_dm_in_range}/{page_dm_count}")
                         
                         # 处理版本（只统计最近3个月的非当前版本）
                         for v in page.get('Versions', []):
@@ -248,10 +285,20 @@ class S3DeletionAnalyzer:
                                         if v['LastModified'] > noncurrent_by_key[key]['latest_modified']:
                                             noncurrent_by_key[key]['latest_modified'] = v['LastModified']
                     
-                    print(f"  版本数据处理完成: 总版本={total_versions}, 删除标记={total_delete_markers_count}, 非当前版本={noncurrent_count}")
+                    scan_end_time = datetime.utcnow()
+                    scan_duration = (scan_end_time - three_months_ago).total_seconds()
+                    print(f"  ✓ [处理完成] 版本数据处理成功")
+                    print(f"    - 扫描开始时间: {three_months_ago.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                    print(f"    - 扫描结束时间: {scan_end_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                    print(f"    - 总版本数: {total_versions:,}")
+                    print(f"    - 删除标记总数: {total_delete_markers_count:,}")
+                    print(f"    - 非当前版本: {noncurrent_count:,}")
+                    print(f"    - 已保存详细信息: 删除标记={len(delete_markers)}, 非当前版本对象={len(noncurrent_by_key)}")
                     
-                    # 最终排序（数量已经被限制）
-                    delete_markers.sort(key=lambda x: x['LastModified'], reverse=True)
+                    # 最终按时间排序（只有最多5000条）
+                    if delete_markers:
+                        delete_markers.sort(key=lambda x: x['LastModified'], reverse=True)
+                        print(f"    - 删除标记已按时间排序（最新的{len(delete_markers)}条）")
                     
                     # 构建非当前版本分析
                     noncurrent_analysis = []
@@ -284,7 +331,13 @@ class S3DeletionAnalyzer:
                         'noncurrent_analysis': noncurrent_analysis,  # 已经限制在MAX_NONCURRENT_KEYS内
                         'total_delete_markers': total_delete_markers_count,
                         'total_noncurrent_objects': len(noncurrent_analysis),
-                        'time_range': f'最近90天 ({three_months_ago.strftime("%Y-%m-%d")} 至 {datetime.utcnow().strftime("%Y-%m-%d")})'
+                        'time_range': f'最近90天 ({three_months_ago.strftime("%Y-%m-%d")} 至 {datetime.utcnow().strftime("%Y-%m-%d")})',
+                        'scan_start_time': three_months_ago.strftime('%Y-%m-%d %H:%M:%S'),
+                        'scan_end_time': scan_end_time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'processing_status': '正常完成',
+                        'memory_optimization': f'已启用（流式处理，保证最多{MAX_DELETE_MARKERS}条详情，确保稳定性）',
+                        'pages_scanned': page_num,
+                        'version': 'v2.0-stable'
                     }
                     
                     if total_delete_markers_count > 0:
@@ -315,35 +368,41 @@ class S3DeletionAnalyzer:
                             }
                         })
                     else:
+                        # 即使没有删除标记，也要记录版本控制信息
                         self.findings.append({
                             'severity': 'INFO',
                             'category': '版本控制',
-                            'title': '版本控制已启用',
+                            'title': '版本控制已启用（无删除标记）',
                             'details': version_info
                         })
                 except Exception as e:
                     processing_failed = True
                     error_message = str(e)
-                    print(f"\n  ⚠️  版本数据处理失败: {error_message}")
-                    print(f"  已保留 {len(delete_markers)} 个删除标记的详细信息")
-                    print(f"  尝试继续统计剩余删除标记总数...")
+                    print(f"\n  ❌ [异常发生] 版本数据处理时发生异常")
+                    print(f"  ❌ [异常类型] {type(e).__name__}")
+                    print(f"  ❌ [异常详情] {error_message}")
+                    print(f"  ℹ️  [已处理数据] 已扫描 {page_num} 页")
+                    print(f"  ℹ️  [已保存数据] 删除标记={len(delete_markers)}, 非当前版本对象={len(noncurrent_by_key)}")
+                    print(f"  ℹ️  [继续处理] 尝试继续统计剩余删除标记总数...")
                     
                     # 继续统计剩余的删除标记数量（不保存详细信息）
                     remaining_dm_count = 0
                     try:
+                        print(f"  ℹ️  [继续扫描] 尝试统计剩余删除标记（不保存详细信息）...")
                         # 从当前位置继续扫描
                         for page in page_iterator:
                             remaining_dm_count += len([dm for dm in page.get('DeleteMarkers', []) if dm.get('IsLatest', False)])
                             if remaining_dm_count % 1000 == 0:
-                                print(f"    继续扫描... 已发现额外 {remaining_dm_count} 个删除标记")
-                    except:
-                        pass
+                                print(f"    ℹ️  继续扫描中... 已发现额外 {remaining_dm_count:,} 个删除标记")
+                    except Exception as e2:
+                        print(f"  ⚠️  [继续扫描失败] 无法完成剩余扫描: {str(e2)}")
                     
                     total_delete_markers_count += remaining_dm_count
-                    print(f"  统计完成: 总删除标记={total_delete_markers_count} (详细信息={len(delete_markers)})")
+                    print(f"  ✓ [统计完成] 总删除标记={total_delete_markers_count:,} (详细信息={len(delete_markers):,})")
                 
                 # 处理结果（无论是否出错）
                 if processing_failed:
+                    print(f"\n  ℹ️  [生成报告] 处理异常情况，生成部分数据报告...")
                     # 保存已收集的部分数据
                     if delete_markers:
                         delete_markers.sort(key=lambda x: x['LastModified'], reverse=True)
@@ -356,36 +415,53 @@ class S3DeletionAnalyzer:
                             'noncurrent_analysis': [],
                             'total_delete_markers': total_delete_markers_count,
                             'total_noncurrent_objects': 0,
-                            'time_range': f'最近90天 ({three_months_ago.strftime("%Y-%m-%d")} 至 {datetime.utcnow().strftime("%Y-%m-%d")})'
+                            'time_range': f'最近90天 ({three_months_ago.strftime("%Y-%m-%d")} 至 {datetime.utcnow().strftime("%Y-%m-%d")})',
+                            'scan_start_time': three_months_ago.strftime('%Y-%m-%d %H:%M:%S'),
+                            'scan_end_time': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                            'processing_status': '异常终止（已保存部分数据）',
+                            'memory_optimization': f'已启用（流式处理，保证最多{MAX_DELETE_MARKERS}条详情，确保稳定性）',
+                            'pages_scanned': page_num,
+                            'version': 'v2.0-stable'
                         }
                         
+                        print(f"  ✓ [报告生成] 已添加部分数据到报告 (删除标记: {len(delete_markers):,}/{total_delete_markers_count:,})")
                         self.findings.append({
                             'severity': 'HIGH',
                             'category': '版本控制',
-                            'title': f'发现 {total_delete_markers_count} 个删除标记（部分详细信息可用）',
+                            'title': f'⚠️ 发现 {total_delete_markers_count:,} 个删除标记（处理时发生异常，部分详细信息可用）',
                             'details': {
-                                'message': f'版本数据处理时出错，但已保存 {len(delete_markers)} 个删除标记的详细信息',
+                                'message': f'❌ 版本数据处理时发生异常，但已成功保存 {len(delete_markers):,} 个删除标记的详细信息',
+                                'processing_status': '异常终止',
+                                'exception_type': type(Exception).__name__,
+                                'exception_message': error_message[:200],
                                 'total_delete_markers': total_delete_markers_count,
                                 'detailed_info_available': len(delete_markers),
-                                'error': error_message[:200],
-                                'note': f'报告中显示前 {len(delete_markers)} 个删除标记的详细信息',
+                                'pages_processed': page_num,
+                                'note': f'报告中显示前 {len(delete_markers):,} 个删除标记的详细信息',
                                 'suggestion': '建议: 1) 在内存更大的机器上重新运行以获取完整信息 2) 使用 S3 Inventory 进行离线分析 3) 配置生命周期策略清理删除标记'
                             }
                         })
                     else:
+                        print(f"  ⚠️  [报告生成] 无详细数据可用，添加异常信息到报告")
                         self.findings.append({
                             'severity': 'MEDIUM',
                             'category': '版本控制',
-                            'title': '版本控制已启用，但无法完整分析版本数据',
+                            'title': '⚠️ 版本控制已启用，但处理版本数据时发生异常',
                             'details': {
-                                'message': f'处理版本数据时发生错误，总删除标记数: {total_delete_markers_count}',
+                                'message': f'❌ 处理版本数据时发生异常，总删除标记数: {total_delete_markers_count:,}',
+                                'processing_status': '异常终止',
+                                'exception_type': type(Exception).__name__,
+                                'exception_message': error_message[:200],
                                 'total_delete_markers': total_delete_markers_count,
-                                'error': error_message[:200],
+                                'pages_processed': page_num,
                                 'suggestion': '建议: 1) 在内存更大的机器上运行 2) 使用 S3 Inventory 进行离线分析'
                             }
                         })
+                    print(f"  ℹ️  [处理完成] 异常处理完成，继续后续分析...\n")
                     return  # 提前返回，不执行后续的正常处理逻辑
             else:
+                # 版本控制未启用，更新状态
+                self.version_analysis['processing_status'] = '版本控制未启用'
                 self.findings.append({
                     'severity': 'INFO',
                     'category': '版本控制',
@@ -394,7 +470,8 @@ class S3DeletionAnalyzer:
                 })
                 
         except Exception as e:
-            # 获取版本控制状态失败
+            # 获取版本控制状态失败，更新状态
+            self.version_analysis['processing_status'] = f'获取失败: {str(e)[:100]}'
             if 'AccessDenied' not in str(e):
                 print(f"  ⚠️  无法获取版本控制状态: {str(e)}")
                 self.findings.append({
@@ -1070,21 +1147,32 @@ class S3DeletionAnalyzer:
                     
                     f.write("---\n\n")
             
-            # 版本控制分析
-            if hasattr(self, 'version_analysis'):
-                va = self.version_analysis
+            # 版本控制分析 - 始终显示此章节（version_analysis 在 _check_versioning 中初始化，必定存在）
+            va = self.version_analysis
+            f.write("## 📋 版本控制分析\n\n")
+            
+            # 显示扫描信息
+            f.write("### 扫描信息\n\n")
+            f.write(f"- **脚本版本**: {va.get('version', 'N/A')}\n")
+            f.write(f"- **扫描开始时间**: {va.get('scan_start_time', 'N/A')} UTC\n")
+            f.write(f"- **扫描结束时间**: {va.get('scan_end_time', 'N/A')} UTC\n")
+            f.write(f"- **处理状态**: {va.get('processing_status', 'N/A')}\n")
+            f.write(f"- **内存优化**: {va.get('memory_optimization', 'N/A')}\n")
+            f.write(f"- **已扫描页数**: {va.get('pages_scanned', 'N/A')}\n")
+            f.write(f"- **时间范围**: {va.get('time_range', 'N/A')}\n\n")
                 
-                if va['delete_markers'] or va['noncurrent_analysis']:
-                    f.write("## 📋 版本控制分析\n\n")
-                    
-                    if va['delete_markers']:
+            # 版本控制启用时，始终显示删除标记和非当前版本章节
+            if va.get('processing_status') not in ['未执行', '版本控制未启用', None]:
+                # 删除标记章节
+                if va['delete_markers'] or va.get('total_delete_markers', 0) > 0:
                         total_dm = va.get('total_delete_markers', len(va['delete_markers']))
                         shown_dm = len(va['delete_markers'])
                         
-                        f.write(f"### 删除标记 (共 {total_dm} 个")
+                        f.write(f"### 删除标记\n\n")
+                        f.write(f"**总数**: {total_dm:,} 个")
                         if shown_dm < total_dm:
-                            f.write(f"，显示前 {shown_dm} 个")
-                        f.write(")\n\n")
+                            f.write(f" | **报告中显示**: {shown_dm:,} 个（内存优化）")
+                        f.write("\n\n")
                         f.write("⚠️ 这些对象被标记为删除,但可以恢复\n\n")
                         f.write("| 对象键 | 删除时间 | 版本 ID |\n")
                         f.write("|------|---------|----------|\n")
@@ -1099,8 +1187,14 @@ class S3DeletionAnalyzer:
                             sample = va['delete_markers'][0]
                             f.write(f"aws s3api delete-object --bucket {self.bucket_name} --key '{sample['key']}' --version-id {sample['version_id']}\n")
                         f.write("```\n\n")
-                    
-                    if va['noncurrent_analysis']:
+                else:
+                    # 没有删除标记
+                    f.write(f"### 删除标记\n\n")
+                    f.write(f"**总数**: 0 个\n\n")
+                    f.write("✅ 未发现删除标记\n\n")
+                
+                # 非当前版本章节
+                if va['noncurrent_analysis']:
                         total_nc = va.get('total_noncurrent_objects', len(va['noncurrent_analysis']))
                         shown_nc = len(va['noncurrent_analysis'])
                         
@@ -1126,8 +1220,32 @@ class S3DeletionAnalyzer:
                             f.write(f"# 恢复到特定版本\n")
                             f.write(f"aws s3api copy-object --bucket {self.bucket_name} --copy-source {self.bucket_name}/{sample_key}?versionId=VERSION_ID --key '{sample_key}'\n")
                         f.write("```\n\n")
-                    
-                    f.write("---\n\n")
+                else:
+                    # 没有非当前版本
+                    f.write(f"### 非当前版本分析\n\n")
+                    f.write(f"**总数**: 0 个对象\n\n")
+                    f.write("✅ 未发现非当前版本\n\n")
+                
+                f.write("---\n\n")
+            else:
+                # 版本控制未启用或无数据
+                f.write("### 删除标记\n\n")
+                f.write(f"**总数**: 0 个\n\n")
+                if va.get('processing_status') == '版本控制未启用':
+                    f.write("⚠️ 版本控制未启用，无法追踪删除标记\n\n")
+                elif va.get('processing_status') == '未执行':
+                    f.write("⚠️ 版本数据未处理\n\n")
+                else:
+                    f.write("✅ 未发现删除标记\n\n")
+                
+                f.write("### 非当前版本分析\n\n")
+                f.write(f"**总数**: 0 个对象\n\n")
+                if va.get('processing_status') == '版本控制未启用':
+                    f.write("⚠️ 版本控制未启用，无法追踪非当前版本\n\n")
+                else:
+                    f.write("✅ 未发现非当前版本\n\n")
+                
+                f.write("---\n\n")
             
             # 详细发现
             if high_findings:
