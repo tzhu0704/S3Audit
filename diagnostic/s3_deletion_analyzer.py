@@ -8,14 +8,15 @@ import boto3
 import argparse
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
 class S3DeletionAnalyzer:
-    def __init__(self, bucket_name, region='us-east-1', skip_object_listing=False):
+    def __init__(self, bucket_name, region='us-east-1', skip_object_listing=False, days=90):
         self.bucket_name = bucket_name
         self.region = region
         self.skip_object_listing = skip_object_listing
+        self.days = days
         self.s3_client = boto3.client('s3', region_name=region)
         self.cloudwatch = boto3.client('cloudwatch', region_name=region)
         self.cloudtrail = boto3.client('cloudtrail', region_name=region)
@@ -33,6 +34,7 @@ class S3DeletionAnalyzer:
         print(f"S3 数据丢失分析报告")
         print(f"Bucket: {self.bucket_name}")
         print(f"分析时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"分析周期: 过去 {self.days} 天")
         print(f"{'='*80}\n")
         
         # 1. CloudWatch 指标分析
@@ -40,31 +42,39 @@ class S3DeletionAnalyzer:
         self._analyze_cloudwatch_metrics()
         
         # 2. 版本控制检查
-        print("[2/7] 检查版本控制和删除标记...")
+        print("[2/8] 检查版本控制和删除标记...")
         self._check_versioning()
         
-        # 3. 生命周期策略检查
-        print("[3/7] 检查生命周期策略...")
+        # 3. 删除标记统计验证
+        print("[3/8] 验证删除标记统计准确性...")
+        self._verify_deletion_marker_count()
+        
+        # 4. 永久删除分析
+        print("[4/8] 分析永久删除迹象...")
+        self._analyze_permanent_deletion()
+        
+        # 5. 生命周期策略检查
+        print("[5/9] 检查生命周期策略...")
         self._check_lifecycle_policy()
         
-        # 4. CloudTrail 事件检查
-        print("[4/7] 检查 CloudTrail 管理事件...")
+        # 6. CloudTrail 事件检查
+        print("[6/9] 检查 CloudTrail 管理事件...")
         self._check_cloudtrail_events()
         
-        # 5. Bucket 策略检查
-        print("[5/7] 检查 Bucket 策略...")
+        # 7. Bucket 策略检查
+        print("[7/9] 检查 Bucket 策略...")
         self._check_bucket_policy()
         
-        # 6. 成本分析
-        print("[6/7] 分析 S3 成本变化...")
+        # 8. 成本分析
+        print("[8/9] 分析 S3 成本变化...")
         self._analyze_costs()
         
-        # 7. 当前对象统计
+        # 9. 当前对象统计
         if not self.skip_object_listing:
-            print("[7/7] 统计当前对象...")
+            print("[9/9] 统计当前对象...")
             self._analyze_current_objects()
         else:
-            print("[7/7] 跳过对象统计(使用 --skip-listing 参数)...")
+            print("[9/9] 跳过对象统计(使用 --skip-listing 参数)...")
             self.current_stats = {'skipped': True}
         
         # 生成报告
@@ -73,8 +83,8 @@ class S3DeletionAnalyzer:
         
     def _analyze_cloudwatch_metrics(self):
         """分析 CloudWatch 指标"""
-        end_time = datetime.utcnow()
-        start_time = end_time - timedelta(days=90)
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(days=self.days)
         
         try:
             # 获取存储量指标
@@ -194,9 +204,12 @@ class S3DeletionAnalyzer:
                 print("  ℹ️  [内存优化] 使用流式处理，限制内存使用")
                 # 流式处理版本数据，避免内存溢出
                 try:
-                    # 计算3个月前的时间
-                    three_months_ago = datetime.utcnow() - timedelta(days=90)
-                    print(f"  ℹ️  [时间范围] 分析最近90天的版本数据 ({three_months_ago.strftime('%Y-%m-%d')} 至今)")
+                    # 计算指定天数前的时间
+                    analysis_start_time = (datetime.now(timezone.utc) - timedelta(days=self.days)).replace(tzinfo=None)
+                    current_time = datetime.now(timezone.utc)
+                    print(f"  ℹ️  [时间范围] 分析最近{self.days}天的版本数据 ({analysis_start_time.strftime('%Y-%m-%d')} 至今)")
+                    print(f"  🔍 [调试-时间] 当前UTC时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"  🔍 [调试-时间] {self.days}天前时间: {analysis_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
                     
                     delete_markers = []
                     noncurrent_by_key = {}
@@ -239,11 +252,12 @@ class S3DeletionAnalyzer:
                         for dm in page.get('DeleteMarkers', []):
                             page_dm_processed += 1
                             is_latest = dm.get('IsLatest', False)
-                            dm_time = dm['LastModified'].replace(tzinfo=None)
-                            in_range = dm_time >= three_months_ago
+                            dm_time_raw = dm['LastModified']
+                            dm_time = dm_time_raw.replace(tzinfo=None) if dm_time_raw.tzinfo else dm_time_raw
+                            in_range = dm_time >= analysis_start_time
                             
-                            if page_dm_processed <= 3:  # 只显示前3个用于调试
-                                print(f"    🔍 [调试-DM{page_dm_processed}] IsLatest={is_latest}, Time={dm_time.strftime('%Y-%m-%d')}, InRange={in_range}")
+                            if page_dm_processed <= 3 and page_num <= 10:  # 前10页显示前3个用于调试
+                                print(f"    🔍 [调试-DM{page_dm_processed}] IsLatest={is_latest}, Time={dm_time.strftime('%Y-%m-%d %H:%M:%S')}, InRange={in_range}")
                             
                             if is_latest and in_range:
                                 page_dm_in_range += 1
@@ -254,16 +268,22 @@ class S3DeletionAnalyzer:
                                     delete_markers.append(dm)
                                     if len(delete_markers) % 500 == 0:
                                         print(f"    ✓ [收集] 已保存 {len(delete_markers)} 个删除标记详细信息")
-                                    # 达到5000后停止收集详细信息，但继续统计总数
+                                    # 达到5000后可以提前退出
                                     if len(delete_markers) == MAX_DELETE_MARKERS:
-                                        print(f"    ✓ [达到限制] 已收集{MAX_DELETE_MARKERS}条详细信息，继续统计总数...")
+                                        print(f"    ✓ [达到限制] 已收集{MAX_DELETE_MARKERS}条详细信息，提前结束扫描")
+                                        break
                         
                         if page_dm_in_range > 0:
                             print(f"    ✓ [本页统计] 符合条件的删除标记: {page_dm_in_range}/{page_dm_count}")
                         
-                        # 处理版本（只统计最近3个月的非当前版本）
+                        # 如果已经收集够了，提前退出
+                        if len(delete_markers) >= MAX_DELETE_MARKERS:
+                            print(f"  ✓ [提前结束] 已收集足够的删除标记样本，停止扫描")
+                            break
+                        
+                        # 处理版本（只统计指定天数内的非当前版本）
                         for v in page.get('Versions', []):
-                            if v['LastModified'].replace(tzinfo=None) >= three_months_ago:
+                            if v['LastModified'].replace(tzinfo=None) >= analysis_start_time:
                                 total_versions += 1
                                 
                                 if not v.get('IsLatest', False):
@@ -285,15 +305,16 @@ class S3DeletionAnalyzer:
                                         if v['LastModified'] > noncurrent_by_key[key]['latest_modified']:
                                             noncurrent_by_key[key]['latest_modified'] = v['LastModified']
                     
-                    scan_end_time = datetime.utcnow()
-                    scan_duration = (scan_end_time - three_months_ago).total_seconds()
+                    scan_end_time = datetime.now(timezone.utc).replace(tzinfo=None)
+                    scan_duration = (scan_end_time - analysis_start_time).total_seconds()
                     print(f"  ✓ [处理完成] 版本数据处理成功")
-                    print(f"    - 扫描开始时间: {three_months_ago.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                    print(f"    - 扫描开始时间: {analysis_start_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
                     print(f"    - 扫描结束时间: {scan_end_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-                    print(f"    - 总版本数: {total_versions:,}")
-                    print(f"    - 删除标记总数: {total_delete_markers_count:,}")
-                    print(f"    - 非当前版本: {noncurrent_count:,}")
-                    print(f"    - 已保存详细信息: 删除标记={len(delete_markers)}, 非当前版本对象={len(noncurrent_by_key)}")
+                    print(f"    - 扫描页数: {page_num:,}")
+                    print(f"    - 总版本数({self.days}天内): {total_versions:,}")
+                    print(f"    - 删除标记总数(所有): {total_delete_markers_count:,}")
+                    print(f"    - 非当前版本({self.days}天内): {noncurrent_count:,}")
+                    print(f"    - 已保存详细信息: 删除标记={len(delete_markers):,}, 非当前版本对象={len(noncurrent_by_key):,}")
                     
                     # 最终按时间排序（只有最多5000条）
                     if delete_markers:
@@ -331,8 +352,8 @@ class S3DeletionAnalyzer:
                         'noncurrent_analysis': noncurrent_analysis,  # 已经限制在MAX_NONCURRENT_KEYS内
                         'total_delete_markers': total_delete_markers_count,
                         'total_noncurrent_objects': len(noncurrent_analysis),
-                        'time_range': f'最近90天 ({three_months_ago.strftime("%Y-%m-%d")} 至 {datetime.utcnow().strftime("%Y-%m-%d")})',
-                        'scan_start_time': three_months_ago.strftime('%Y-%m-%d %H:%M:%S'),
+                        'time_range': f'最近{self.days}天 ({analysis_start_time.strftime("%Y-%m-%d")} 至 {datetime.now(timezone.utc).strftime("%Y-%m-%d")})',
+                        'scan_start_time': analysis_start_time.strftime('%Y-%m-%d %H:%M:%S'),
                         'scan_end_time': scan_end_time.strftime('%Y-%m-%d %H:%M:%S'),
                         'processing_status': '正常完成',
                         'memory_optimization': f'已启用（流式处理，保证最多{MAX_DELETE_MARKERS}条详情，确保稳定性）',
@@ -341,17 +362,60 @@ class S3DeletionAnalyzer:
                     }
                     
                     if total_delete_markers_count > 0:
-                        title_msg = f'最近90天发现 {total_delete_markers_count} 个删除标记'
+                        # 统计删除标记的详细信息
+                        latest_dm_count = sum(1 for dm in delete_markers if dm.get('IsLatest', False))
+                        non_latest_dm_count = len(delete_markers) - latest_dm_count
+                        
+                        # 统计指定天数内的删除标记
+                        dm_in_range = sum(1 for dm in delete_markers 
+                                          if dm.get('LastModified', datetime.min).replace(tzinfo=None) >= analysis_start_time)
+                        
+                        title_msg = f'发现 {total_delete_markers_count:,} 个删除标记'
                         if total_delete_markers_count > len(delete_markers):
-                            title_msg += f' (报告中显示前 {len(delete_markers)} 个)'
+                            title_msg += f' (报告中显示前 {len(delete_markers):,} 个)'
+                        
+                        details_msg = f'扫描了 {page_num:,} 页数据，发现 {total_delete_markers_count:,} 个删除标记。'
+                        if dm_in_range > 0:
+                            details_msg += f' 其中 {dm_in_range:,} 个在最近{self.days}天内创建。'
+                        if latest_dm_count > 0:
+                            details_msg += f' {latest_dm_count:,} 个是当前版本（IsLatest=True，可恢复）。'
+                        if non_latest_dm_count > 0:
+                            details_msg += f' {non_latest_dm_count:,} 个不是当前版本（IsLatest=False）。'
                         
                         self.findings.append({
                             'severity': 'MEDIUM',
                             'category': '版本控制',
                             'title': title_msg,
                             'details': {
-                                'message': f'这些对象在最近90天内被标记为删除,但可以恢复',
-                                'time_range': f'{three_months_ago.strftime("%Y-%m-%d")} 至 {datetime.utcnow().strftime("%Y-%m-%d")}',
+                                'message': details_msg,
+                                'total_count': total_delete_markers_count,
+                                'in_range': dm_in_range,
+                                'latest_count': latest_dm_count,
+                                'non_latest_count': non_latest_dm_count,
+                                'pages_scanned': page_num,
+                                'time_range': f'{analysis_start_time.strftime("%Y-%m-%d")} 至 {datetime.now(timezone.utc).strftime("%Y-%m-%d")}',
+                                'version_info': version_info
+                            }
+                        })
+                    elif total_versions > 0 and noncurrent_count == 0 and total_delete_markers_count == 0:
+                        # 有版本但没有非当前版本和删除标记，说明可能有问题
+                        self.findings.append({
+                            'severity': 'HIGH',
+                            'category': '版本控制',
+                            'title': '⚠️ 版本控制已启用但未发现任何删除标记或历史版本',
+                            'details': {
+                                'message': f'虽然版本控制已启用，但在最近{self.days}天内扫描了{page_num:,}页、{total_versions:,}个版本，未发现任何删除标记或非当前版本。这意味着所有版本都是IsLatest=True（当前版本）。',
+                                'analysis': '如果CloudWatch显示有大量对象删除，最可能的原因是：对象被永久删除（使用了带versionId的DeleteObject API），而不是软删除。',
+                                'explanation': '软删除会创建删除标记（可恢复），永久删除会直接删除版本（不留痕迹）。当前情况符合永久删除的特征。',
+                                'possible_causes': [
+                                    '1. 备份软件（如Veeam）的自动清理功能使用永久删除',
+                                    '2. 生命周期策略配置了NoncurrentVersionExpiration',
+                                    '3. 自定义脚本或工具执行永久删除操作',
+                                    '4. 手动使用带--version-id参数的删除命令'
+                                ],
+                                'recommendation': '强烈建议启用CloudTrail数据事件以追踪所有DeleteObject操作（包括versionId参数）',
+                                'note': 'CloudTrail管理事件不包含DeleteObject操作，需要单独启用数据事件',
+                                'time_range': f'{analysis_start_time.strftime("%Y-%m-%d")} 至 {datetime.now(timezone.utc).strftime("%Y-%m-%d")}',
                                 'version_info': version_info
                             }
                         })
@@ -360,10 +424,10 @@ class S3DeletionAnalyzer:
                         self.findings.append({
                             'severity': 'INFO',
                             'category': '版本控制',
-                            'title': f'最近90天发现 {len(noncurrent_analysis)} 个对象有非当前版本',
+                            'title': f'最近{self.days}天发现 {len(noncurrent_analysis)} 个对象有非当前版本',
                             'details': {
-                                'message': f'最近90天内共 {noncurrent_count} 个非当前版本,可能包含被覆盖或删除的数据',
-                                'time_range': f'{three_months_ago.strftime("%Y-%m-%d")} 至 {datetime.utcnow().strftime("%Y-%m-%d")}',
+                                'message': f'最近{self.days}天内共 {noncurrent_count} 个非当前版本,可能包含被覆盖或删除的数据',
+                                'time_range': f'{analysis_start_time.strftime("%Y-%m-%d")} 至 {datetime.now(timezone.utc).strftime("%Y-%m-%d")}',
                                 'version_info': version_info
                             }
                         })
@@ -415,9 +479,9 @@ class S3DeletionAnalyzer:
                             'noncurrent_analysis': [],
                             'total_delete_markers': total_delete_markers_count,
                             'total_noncurrent_objects': 0,
-                            'time_range': f'最近90天 ({three_months_ago.strftime("%Y-%m-%d")} 至 {datetime.utcnow().strftime("%Y-%m-%d")})',
-                            'scan_start_time': three_months_ago.strftime('%Y-%m-%d %H:%M:%S'),
-                            'scan_end_time': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                            'time_range': f'最近{self.days}天 ({analysis_start_time.strftime("%Y-%m-%d")} 至 {datetime.now(timezone.utc).strftime("%Y-%m-%d")})',
+                            'scan_start_time': analysis_start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                            'scan_end_time': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
                             'processing_status': '异常终止（已保存部分数据）',
                             'memory_optimization': f'已启用（流式处理，保证最多{MAX_DELETE_MARKERS}条详情，确保稳定性）',
                             'pages_scanned': page_num,
@@ -481,6 +545,421 @@ class S3DeletionAnalyzer:
                     'details': str(e)
                 })
     
+    def _verify_deletion_marker_count(self):
+        """验证删除标记统计的准确性"""
+        print("  正在验证删除标记统计...")
+        
+        verification_result = {
+            'verification_performed': False,
+            'sample_verification': False,
+            'current_objects_count': 0,
+            'total_versions_count': 0,
+            'delete_markers_count': 0,
+            'expected_vs_actual': {},
+            'verification_conclusion': '',
+            'confidence_in_stats': 'unknown'
+        }
+        
+        try:
+            # 如果跳过对象列表，进行采样验证
+            if self.skip_object_listing:
+                print("    使用采样验证方法（因为启用了--skip-listing）...")
+                verification_result['sample_verification'] = True
+                
+                # 采样验证：随机检查一些前缀
+                sample_prefixes = ['backup/', 'data/', 'logs/', 'archive/', '']  # 常见前缀
+                total_sample_objects = 0
+                total_sample_versions = 0
+                total_sample_delete_markers = 0
+                
+                for prefix in sample_prefixes:
+                    try:
+                        print(f"      检查前缀: '{prefix}'...")
+                        
+                        # 列出当前对象（最多1000个）
+                        current_response = self.s3_client.list_objects_v2(
+                            Bucket=self.bucket_name,
+                            Prefix=prefix,
+                            MaxKeys=1000
+                        )
+                        current_count = len(current_response.get('Contents', []))
+                        total_sample_objects += current_count
+                        
+                        # 列出所有版本（最多1000个）
+                        versions_response = self.s3_client.list_object_versions(
+                            Bucket=self.bucket_name,
+                            Prefix=prefix,
+                            MaxKeys=1000
+                        )
+                        
+                        versions_count = len(versions_response.get('Versions', []))
+                        delete_markers_count = len(versions_response.get('DeleteMarkers', []))
+                        
+                        total_sample_versions += versions_count
+                        total_sample_delete_markers += delete_markers_count
+                        
+                        print(f"        当前对象: {current_count}, 版本: {versions_count}, 删除标记: {delete_markers_count}")
+                        
+                    except Exception as e:
+                        print(f"        跳过前缀 '{prefix}': {str(e)}")
+                        continue
+                
+                verification_result['current_objects_count'] = total_sample_objects
+                verification_result['total_versions_count'] = total_sample_versions
+                verification_result['delete_markers_count'] = total_sample_delete_markers
+                verification_result['verification_performed'] = True
+                
+                print(f"    采样结果: 当前对象={total_sample_objects}, 版本={total_sample_versions}, 删除标记={total_sample_delete_markers}")
+                
+            else:
+                print("    使用完整验证方法...")
+                # 完整验证：统计所有对象和版本
+                
+                # 统计当前对象
+                current_objects = 0
+                paginator = self.s3_client.get_paginator('list_objects_v2')
+                for page in paginator.paginate(Bucket=self.bucket_name):
+                    current_objects += len(page.get('Contents', []))
+                    if current_objects % 10000 == 0:
+                        print(f"      已统计当前对象: {current_objects:,}")
+                
+                # 统计所有版本和删除标记
+                total_versions = 0
+                total_delete_markers = 0
+                paginator = self.s3_client.get_paginator('list_object_versions')
+                page_count = 0
+                
+                for page in paginator.paginate(Bucket=self.bucket_name):
+                    page_count += 1
+                    versions = page.get('Versions', [])
+                    delete_markers = page.get('DeleteMarkers', [])
+                    
+                    total_versions += len(versions)
+                    total_delete_markers += len(delete_markers)
+                    
+                    if page_count % 100 == 0:
+                        print(f"      已处理 {page_count} 页, 版本: {total_versions:,}, 删除标记: {total_delete_markers:,}")
+                
+                verification_result['current_objects_count'] = current_objects
+                verification_result['total_versions_count'] = total_versions
+                verification_result['delete_markers_count'] = total_delete_markers
+                verification_result['verification_performed'] = True
+                
+                print(f"    完整统计结果: 当前对象={current_objects:,}, 版本={total_versions:,}, 删除标记={total_delete_markers:,}")
+            
+            # 对比验证结果与之前的统计
+            if hasattr(self, 'version_analysis'):
+                va = self.version_analysis
+                reported_delete_markers = va.get('total_delete_markers', 0)
+                is_verify_only_mode = va.get('verify_only_mode', False)
+                
+                verification_result['expected_vs_actual'] = {
+                    'reported_delete_markers': reported_delete_markers,
+                    'verified_delete_markers': verification_result['delete_markers_count'],
+                    'difference': abs(reported_delete_markers - verification_result['delete_markers_count'])
+                }
+                
+                # 判断统计准确性
+                if is_verify_only_mode:
+                    # 仅验证模式：没有原始统计可对比
+                    if verification_result['delete_markers_count'] == 0:
+                        verification_result['verification_conclusion'] = '独立验证确认：未发现删除标记'
+                        verification_result['confidence_in_stats'] = '高'
+                    else:
+                        verification_result['verification_conclusion'] = f'独立验证发现{verification_result["delete_markers_count"]}个删除标记'
+                        verification_result['confidence_in_stats'] = '高'
+                elif verification_result['sample_verification']:
+                    # 采样验证的容错度更高
+                    if verification_result['delete_markers_count'] == 0 and reported_delete_markers == 0:
+                        verification_result['verification_conclusion'] = '采样验证确认：删除标记统计正确（均为0）'
+                        verification_result['confidence_in_stats'] = '高'
+                    elif verification_result['delete_markers_count'] > 0 and reported_delete_markers == 0:
+                        verification_result['verification_conclusion'] = f'采样验证发现{verification_result["delete_markers_count"]}个删除标记，但原统计为0，可能存在统计遗漏'
+                        verification_result['confidence_in_stats'] = '低'
+                    elif abs(verification_result['delete_markers_count'] - reported_delete_markers) <= max(reported_delete_markers * 0.1, 5):
+                        # 采样验证允许10%的误差或最多5个差异
+                        verification_result['verification_conclusion'] = f'采样验证基本一致：原统计{reported_delete_markers}个，验证{verification_result["delete_markers_count"]}个（采样误差范围内）'
+                        verification_result['confidence_in_stats'] = '高'
+                    else:
+                        verification_result['verification_conclusion'] = f'采样验证发现差异：原统计{reported_delete_markers}个，验证{verification_result["delete_markers_count"]}个'
+                        verification_result['confidence_in_stats'] = '中'
+                else:
+                    # 完整验证的准确度更高
+                    difference = verification_result['expected_vs_actual']['difference']
+                    if difference == 0:
+                        verification_result['verification_conclusion'] = '完整验证确认：删除标记统计完全正确'
+                        verification_result['confidence_in_stats'] = '高'
+                    elif difference < 100:
+                        verification_result['verification_conclusion'] = f'完整验证发现轻微差异（{difference}个），统计基本正确'
+                        verification_result['confidence_in_stats'] = '高'
+                    else:
+                        verification_result['verification_conclusion'] = f'完整验证发现显著差异（{difference}个），统计可能有问题'
+                        verification_result['confidence_in_stats'] = '低'
+                
+                # 添加发现到报告
+                if verification_result['confidence_in_stats'] == '低':
+                    self.findings.append({
+                        'severity': 'HIGH',
+                        'category': '统计验证',
+                        'title': '⚠️ 删除标记统计可能不准确',
+                        'details': {
+                            'verification_method': '采样验证' if verification_result['sample_verification'] else '完整验证',
+                            'original_count': reported_delete_markers,
+                            'verified_count': verification_result['delete_markers_count'],
+                            'difference': verification_result['expected_vs_actual']['difference'],
+                            'conclusion': verification_result['verification_conclusion'],
+                            'recommendation': '建议使用完整验证模式重新运行分析（不使用--skip-listing参数）'
+                        }
+                    })
+                elif verification_result['confidence_in_stats'] == '高':
+                    self.findings.append({
+                        'severity': 'INFO',
+                        'category': '统计验证',
+                        'title': '✅ 删除标记统计验证通过',
+                        'details': {
+                            'verification_method': '采样验证' if verification_result['sample_verification'] else '完整验证',
+                            'verified_count': verification_result['delete_markers_count'],
+                            'conclusion': verification_result['verification_conclusion'],
+                            'confidence': '统计结果可信'
+                        }
+                    })
+            
+        except Exception as e:
+            verification_result['verification_conclusion'] = f'验证过程出错: {str(e)}'
+            verification_result['confidence_in_stats'] = '未知'
+            print(f"    验证过程出错: {str(e)}")
+            
+            self.findings.append({
+                'severity': 'MEDIUM',
+                'category': '统计验证',
+                'title': '⚠️ 无法验证删除标记统计',
+                'details': {
+                    'error': str(e),
+                    'recommendation': '建议手动验证或使用不同的参数重新运行'
+                }
+            })
+        
+        # 保存验证结果
+        self.verification_result = verification_result
+        
+        print(f"  ✓ 删除标记统计验证完成")
+        print(f"    - 结论: {verification_result['verification_conclusion']}")
+        print(f"    - 统计可信度: {verification_result['confidence_in_stats']}")
+    
+    def _analyze_permanent_deletion(self):
+        """分析永久删除迹象"""
+        print("  正在分析永久删除迹象...")
+        
+        # 初始化分析结果
+        permanent_deletion_analysis = {
+            'has_cloudwatch_deletions': False,
+            'has_delete_markers': False,
+            'has_noncurrent_versions': False,
+            'has_lifecycle_policy': False,
+            'cloudwatch_deletion_count': 0,
+            'delete_marker_count': 0,
+            'noncurrent_version_count': 0,
+            'analysis_conclusion': '',
+            'confidence_level': '',
+            'evidence': []
+        }
+        
+        # 检查CloudWatch是否显示对象删除
+        if hasattr(self, 'count_data') and self.count_data:
+            deletion_events = 0
+            total_deleted_objects = 0
+            
+            for i in range(1, len(self.count_data)):
+                prev_count = self.count_data[i-1]['Average']
+                curr_count = self.count_data[i]['Average']
+                change = curr_count - prev_count
+                
+                if change < -100:  # 减少超过100个对象
+                    deletion_events += 1
+                    total_deleted_objects += abs(change)
+            
+            if deletion_events > 0:
+                permanent_deletion_analysis['has_cloudwatch_deletions'] = True
+                permanent_deletion_analysis['cloudwatch_deletion_count'] = int(total_deleted_objects)
+                permanent_deletion_analysis['evidence'].append(
+                    f"CloudWatch显示{deletion_events}次删除事件，共删除约{int(total_deleted_objects):,}个对象"
+                )
+        
+        # 检查删除标记情况
+        if hasattr(self, 'version_analysis'):
+            va = self.version_analysis
+            delete_marker_count = va.get('total_delete_markers', 0)
+            noncurrent_count = va.get('total_noncurrent_objects', 0)
+            
+            permanent_deletion_analysis['delete_marker_count'] = delete_marker_count
+            permanent_deletion_analysis['noncurrent_version_count'] = noncurrent_count
+            
+            if delete_marker_count > 0:
+                permanent_deletion_analysis['has_delete_markers'] = True
+                permanent_deletion_analysis['evidence'].append(
+                    f"发现{delete_marker_count:,}个删除标记（软删除）"
+                )
+            
+            if noncurrent_count > 0:
+                permanent_deletion_analysis['has_noncurrent_versions'] = True
+                permanent_deletion_analysis['evidence'].append(
+                    f"发现{noncurrent_count:,}个对象有非当前版本"
+                )
+        
+        # 检查生命周期策略（预检查）
+        try:
+            response = self.s3_client.get_bucket_lifecycle_configuration(Bucket=self.bucket_name)
+            rules = response.get('Rules', [])
+            active_deletion_rules = []
+            
+            for rule in rules:
+                if rule.get('Status') == 'Enabled':
+                    if ('Expiration' in rule or 
+                        'NoncurrentVersionExpiration' in rule or 
+                        'AbortIncompleteMultipartUpload' in rule):
+                        active_deletion_rules.append(rule.get('ID', 'Unnamed'))
+            
+            if active_deletion_rules:
+                permanent_deletion_analysis['has_lifecycle_policy'] = True
+                permanent_deletion_analysis['evidence'].append(
+                    f"发现{len(active_deletion_rules)}条生命周期删除规则: {', '.join(active_deletion_rules)}"
+                )
+        except Exception:
+            pass  # 生命周期策略不存在或无权限
+        
+        # 分析结论
+        has_deletions = permanent_deletion_analysis['has_cloudwatch_deletions']
+        has_markers = permanent_deletion_analysis['has_delete_markers']
+        has_lifecycle = permanent_deletion_analysis['has_lifecycle_policy']
+        
+        if has_deletions and not has_markers and not has_lifecycle:
+            # CloudWatch显示删除，但没有删除标记，也没有生命周期策略
+            permanent_deletion_analysis['analysis_conclusion'] = '永久删除（高度可能）'
+            permanent_deletion_analysis['confidence_level'] = '高'
+            permanent_deletion_analysis['evidence'].append(
+                "结论：对象很可能被永久删除（使用带versionId的DeleteObject API）"
+            )
+            permanent_deletion_analysis['evidence'].append(
+                "原因：CloudWatch显示大量对象删除，但未发现删除标记，且无自动删除策略"
+            )
+            
+            self.findings.append({
+                'severity': 'HIGH',
+                'category': '永久删除分析',
+                'title': '⚠️ 检测到永久删除迹象（高置信度）',
+                'details': {
+                    'conclusion': '对象很可能被永久删除，无法通过S3版本控制恢复',
+                    'deleted_objects': permanent_deletion_analysis['cloudwatch_deletion_count'],
+                    'delete_markers_found': permanent_deletion_analysis['delete_marker_count'],
+                    'confidence': '高',
+                    'explanation': '永久删除使用带versionId的DeleteObject API，直接删除对象版本，不创建删除标记',
+                    'recovery_possibility': '无法恢复（除非有备份）',
+                    'evidence': permanent_deletion_analysis['evidence'],
+                    'recommendations': [
+                        '1. 启用CloudTrail数据事件以追踪所有DeleteObject操作',
+                        '2. 检查备份软件（如Veeam）的删除策略配置',
+                        '3. 考虑启用S3 Object Lock防止意外删除',
+                        '4. 配置S3 Inventory定期生成对象清单'
+                    ]
+                }
+            })
+            
+        elif has_deletions and has_markers:
+            # CloudWatch显示删除，且有删除标记
+            permanent_deletion_analysis['analysis_conclusion'] = '软删除（可恢复）'
+            permanent_deletion_analysis['confidence_level'] = '高'
+            permanent_deletion_analysis['evidence'].append(
+                "结论：对象被软删除，可以通过删除删除标记来恢复"
+            )
+            
+            self.findings.append({
+                'severity': 'MEDIUM',
+                'category': '永久删除分析',
+                'title': '✅ 检测到软删除（可恢复）',
+                'details': {
+                    'conclusion': '对象被软删除，可以恢复',
+                    'deleted_objects': permanent_deletion_analysis['cloudwatch_deletion_count'],
+                    'delete_markers_found': permanent_deletion_analysis['delete_marker_count'],
+                    'confidence': '高',
+                    'recovery_possibility': '可以恢复',
+                    'evidence': permanent_deletion_analysis['evidence'],
+                    'recovery_instructions': [
+                        '1. 使用aws s3api delete-object --version-id删除删除标记',
+                        '2. 或使用S3控制台的"显示版本"功能恢复对象'
+                    ]
+                }
+            })
+            
+        elif has_deletions and has_lifecycle:
+            # CloudWatch显示删除，且有生命周期策略
+            permanent_deletion_analysis['analysis_conclusion'] = '生命周期自动删除'
+            permanent_deletion_analysis['confidence_level'] = '高'
+            permanent_deletion_analysis['evidence'].append(
+                "结论：对象被生命周期策略自动删除"
+            )
+            
+            self.findings.append({
+                'severity': 'MEDIUM',
+                'category': '永久删除分析',
+                'title': '🔄 检测到生命周期自动删除',
+                'details': {
+                    'conclusion': '对象被生命周期策略自动删除',
+                    'deleted_objects': permanent_deletion_analysis['cloudwatch_deletion_count'],
+                    'confidence': '高',
+                    'recovery_possibility': '取决于策略类型',
+                    'evidence': permanent_deletion_analysis['evidence'],
+                    'recommendations': [
+                        '1. 检查生命周期策略配置是否符合预期',
+                        '2. 如果策略配置错误，及时修正以防止进一步删除'
+                    ]
+                }
+            })
+            
+        elif not has_deletions:
+            # CloudWatch没有显示删除
+            permanent_deletion_analysis['analysis_conclusion'] = '无明显删除迹象'
+            permanent_deletion_analysis['confidence_level'] = '高'
+            
+            self.findings.append({
+                'severity': 'INFO',
+                'category': '永久删除分析',
+                'title': '✅ 未检测到明显的删除迹象',
+                'details': {
+                    'conclusion': '在分析期间内未发现明显的对象删除',
+                    'confidence': '高',
+                    'evidence': permanent_deletion_analysis['evidence'] or ['CloudWatch指标未显示显著的对象数量减少']
+                }
+            })
+        else:
+            # 其他情况
+            permanent_deletion_analysis['analysis_conclusion'] = '需要进一步分析'
+            permanent_deletion_analysis['confidence_level'] = '中'
+            
+            self.findings.append({
+                'severity': 'INFO',
+                'category': '永久删除分析',
+                'title': '❓ 删除模式需要进一步分析',
+                'details': {
+                    'conclusion': '删除模式不明确，需要更多信息',
+                    'confidence': '中',
+                    'evidence': permanent_deletion_analysis['evidence'],
+                    'recommendations': [
+                        '1. 启用CloudTrail数据事件获取详细的删除操作记录',
+                        '2. 扩大分析时间范围（使用--days参数）',
+                        '3. 检查应用程序日志和备份软件日志'
+                    ]
+                }
+            })
+        
+        # 保存分析结果供报告使用
+        self.permanent_deletion_analysis = permanent_deletion_analysis
+        
+        print(f"  ✓ 永久删除分析完成")
+        print(f"    - 结论: {permanent_deletion_analysis['analysis_conclusion']}")
+        print(f"    - 置信度: {permanent_deletion_analysis['confidence_level']}")
+        if permanent_deletion_analysis['evidence']:
+            print(f"    - 证据数量: {len(permanent_deletion_analysis['evidence'])}")
+    
     def _check_lifecycle_policy(self):
         """检查生命周期策略"""
         try:
@@ -525,7 +1004,7 @@ class S3DeletionAnalyzer:
     def _check_cloudtrail_events(self):
         """检查 CloudTrail 事件"""
         try:
-            start_time = datetime.utcnow() - timedelta(days=90)
+            start_time = datetime.now(timezone.utc) - timedelta(days=self.days)
             
             # 查询管理事件
             response = self.cloudtrail.lookup_events(
@@ -612,14 +1091,14 @@ class S3DeletionAnalyzer:
                     self.findings.append({
                         'severity': 'INFO',
                         'category': 'CloudTrail 事件',
-                        'title': f'过去 90 天有 {len(events)} 个管理事件',
+                        'title': f'过去 {self.days} 天有 {len(events)} 个管理事件',
                         'details': '未发现关键的配置变更或删除操作'
                     })
                 else:
                     self.findings.append({
                         'severity': 'INFO',
                         'category': 'CloudTrail 事件',
-                        'title': '过去 90 天无管理事件',
+                        'title': f'过去 {self.days} 天无管理事件',
                         'details': '未发现任何 bucket 级别的管理操作'
                     })
                 
@@ -667,8 +1146,8 @@ class S3DeletionAnalyzer:
     def _analyze_costs(self):
         """分析 S3 成本变化"""
         try:
-            end_date = datetime.utcnow().date()
-            start_date = end_date - timedelta(days=90)
+            end_date = datetime.now(timezone.utc).date()
+            start_date = end_date - timedelta(days=self.days)
             
             # 获取该区域 S3 每日成本（按用量类型分组）
             response = self.ce_client.get_cost_and_usage(
@@ -926,7 +1405,7 @@ class S3DeletionAnalyzer:
             f.write(f"# S3 数据丢失分析报告\n\n")
             f.write(f"**Bucket**: `{report_data['bucket']}`  \n")
             f.write(f"**分析时间**: {datetime.fromisoformat(report_data['analysis_time']).strftime('%Y-%m-%d %H:%M:%S')}  \n")
-            f.write(f"**分析周期**: 过去 90 天\n\n")
+            f.write(f"**分析周期**: 过去 {self.days} 天\n\n")
             f.write("---\n\n")
             
             # 执行摘要
@@ -947,7 +1426,7 @@ class S3DeletionAnalyzer:
             f.write("\n---\n\n")
             
             # CloudWatch 指标趋势 - 合并显示
-            f.write("## 📈 CloudWatch 指标趋势 (过去 90 天)\n\n")
+            f.write(f"## 📈 CloudWatch 指标趋势 (过去 {self.days} 天)\n\n")
             
             size_data = report_data['cloudwatch_data']['size_data']
             count_data = report_data['cloudwatch_data']['count_data']
@@ -1000,7 +1479,7 @@ class S3DeletionAnalyzer:
             # 成本趋势分析
             cost_data = report_data.get('cost_data', [])
             if cost_data:
-                f.write("## 💰 S3 成本趋势 (过去 90 天)\n\n")
+                f.write(f"## 💰 S3 成本趋势 (过去 {self.days} 天)\n\n")
                 
                 f.write(f"⚠️ **注意**: 此成本数据为 {self.region} 区域的 S3 总成本，不仅限于单个 bucket。  \n")
                 f.write("可以通过成本变化趋势间接判断数据变化。\n\n")
@@ -1081,7 +1560,7 @@ class S3DeletionAnalyzer:
                 total_events = sum(len(v) for v in ct_events.values())
                 
                 if total_events > 0:
-                    f.write("## 🔍 CloudTrail 事件汇总 (过去 90 天)\n\n")
+                    f.write(f"## 🔍 CloudTrail 事件汇总 (过去 {self.days} 天)\n\n")
                     
                     # 统计概览
                     f.write("### 事件统计\n\n")
@@ -1244,6 +1723,105 @@ class S3DeletionAnalyzer:
                     f.write("⚠️ 版本控制未启用，无法追踪非当前版本\n\n")
                 else:
                     f.write("✅ 未发现非当前版本\n\n")
+                
+                f.write("---\n\n")
+            
+            # 统计验证章节
+            if hasattr(self, 'verification_result'):
+                vr = self.verification_result
+                f.write("## 🔍 删除标记统计验证\n\n")
+                
+                if vr['verification_performed']:
+                    f.write("### 验证结果\n\n")
+                    f.write(f"**验证方法**: {'采样验证' if vr['sample_verification'] else '完整验证'}  \n")
+                    f.write(f"**验证结论**: {vr['verification_conclusion']}  \n")
+                    f.write(f"**统计可信度**: {vr['confidence_in_stats']}  \n\n")
+                    
+                    f.write("### 验证数据\n\n")
+                    f.write("| 项目 | 数量 |\n")
+                    f.write("|------|------|\n")
+                    f.write(f"| 当前对象 | {vr['current_objects_count']:,} |\n")
+                    f.write(f"| 总版本数 | {vr['total_versions_count']:,} |\n")
+                    f.write(f"| 删除标记 | {vr['delete_markers_count']:,} |\n\n")
+                    
+                    if vr['expected_vs_actual']:
+                        eva = vr['expected_vs_actual']
+                        f.write("### 对比分析\n\n")
+                        f.write("| 统计方式 | 删除标记数量 | 差异 |\n")
+                        f.write("|---------|-------------|------|\n")
+                        f.write(f"| 原始统计 | {eva['reported_delete_markers']:,} | - |\n")
+                        f.write(f"| 验证统计 | {eva['verified_delete_markers']:,} | {eva['difference']:,} |\n\n")
+                        
+                        if eva['difference'] == 0:
+                            f.write("✅ **验证通过**：两种统计方法结果一致，删除标记统计准确。\n\n")
+                        elif eva['difference'] > 0:
+                            f.write(f"⚠️ **发现差异**：验证发现 {eva['difference']:,} 个差异，建议进一步检查。\n\n")
+                    
+                    if vr['sample_verification']:
+                        f.write("### 采样说明\n\n")
+                        f.write("由于启用了 `--skip-listing` 参数，使用采样验证方法：\n")
+                        f.write("- 检查常见前缀：backup/, data/, logs/, archive/, 根目录\n")
+                        f.write("- 每个前缀最多检查1000个对象\n")
+                        f.write("- 采样结果可能不完整，建议完整验证以获得准确结果\n\n")
+                        f.write("**完整验证命令**：\n")
+                        f.write(f"```bash\n")
+                        f.write(f"python s3_deletion_analyzer.py --bucket {self.bucket_name} --days {self.days}\n")
+                        f.write(f"```\n\n")
+                else:
+                    f.write("### 验证失败\n\n")
+                    f.write(f"**原因**: {vr['verification_conclusion']}  \n")
+                    f.write("**建议**: 检查权限或网络连接后重试\n\n")
+                
+                f.write("---\n\n")
+            
+            # 永久删除分析章节
+            if hasattr(self, 'permanent_deletion_analysis'):
+                pda = self.permanent_deletion_analysis
+                f.write("## 🔍 永久删除分析\n\n")
+                
+                f.write("### 分析结论\n\n")
+                f.write(f"**结论**: {pda['analysis_conclusion']}  \n")
+                f.write(f"**置信度**: {pda['confidence_level']}  \n\n")
+                
+                if pda['has_cloudwatch_deletions']:
+                    f.write(f"**CloudWatch检测到的删除**: {pda['cloudwatch_deletion_count']:,} 个对象  \n")
+                if pda['delete_marker_count'] > 0:
+                    f.write(f"**删除标记数量**: {pda['delete_marker_count']:,} 个  \n")
+                if pda['noncurrent_version_count'] > 0:
+                    f.write(f"**非当前版本对象**: {pda['noncurrent_version_count']:,} 个  \n")
+                f.write("\n")
+                
+                if pda['evidence']:
+                    f.write("### 分析证据\n\n")
+                    for i, evidence in enumerate(pda['evidence'], 1):
+                        f.write(f"{i}. {evidence}\n")
+                    f.write("\n")
+                
+                # 删除类型说明
+                f.write("### 删除类型说明\n\n")
+                f.write("| 删除类型 | API调用 | 删除标记 | 可恢复性 | 特征 |\n")
+                f.write("|---------|---------|----------|----------|------|\n")
+                f.write("| **软删除** | `DELETE /object` | ✅ 创建 | ✅ 可恢复 | 有删除标记，CloudWatch显示删除 |\n")
+                f.write("| **永久删除** | `DELETE /object?versionId=xxx` | ❌ 不创建 | ❌ 不可恢复 | 无删除标记，CloudWatch显示删除 |\n")
+                f.write("| **生命周期删除** | 自动执行 | 取决于策略 | 取决于策略 | 有生命周期规则，定期删除 |\n\n")
+                
+                # 验证方法
+                f.write("### 进一步验证方法\n\n")
+                f.write("如需确认删除类型，可以：\n\n")
+                f.write("1. **启用CloudTrail数据事件**：\n")
+                f.write("   ```json\n")
+                f.write("   {\n")
+                f.write('     "eventName": "DeleteObject",\n')
+                f.write('     "requestParameters": {\n')
+                f.write(f'       "bucketName": "{self.bucket_name}",\n')
+                f.write('       "key": "some-file",\n')
+                f.write('       "versionId": "xxx"  // 如果有此字段=永久删除\n')
+                f.write("     }\n")
+                f.write("   }\n")
+                f.write("   ```\n\n")
+                f.write("2. **检查应用程序日志**：查看备份软件（如Veeam）的删除操作日志\n\n")
+                f.write("3. **扩大分析时间范围**：使用 `--days 365` 分析更长时间段\n\n")
+                f.write("4. **S3 Server Access Logging**：启用详细的访问日志记录\n\n")
                 
                 f.write("---\n\n")
             
@@ -1418,8 +1996,17 @@ def main():
   # 指定区域
   python s3_deletion_analyzer.py --bucket my-bucket --region us-west-2
   
+  # 分析最近180天的数据
+  python s3_deletion_analyzer.py --bucket my-bucket --days 180
+  
   # 跳过对象列表(适用于大型 bucket)
   python s3_deletion_analyzer.py --bucket large-bucket --skip-listing
+  
+  # 仅验证删除标记统计（快速验证）
+  python s3_deletion_analyzer.py --bucket my-bucket --verify-only
+  
+  # 采样验证删除标记统计
+  python s3_deletion_analyzer.py --bucket my-bucket --verify-only --skip-listing
   
 注意:
   - 报告将保存在当前目录的 logs/ 子目录下
@@ -1428,13 +2015,82 @@ def main():
     )
     parser.add_argument('--bucket', required=True, help='S3 bucket 名称')
     parser.add_argument('--region', default='us-east-1', help='AWS 区域 (默认: us-east-1)')
+    parser.add_argument('--days', type=int, default=90, help='分析天数 (默认: 90天)')
     parser.add_argument('--skip-listing', action='store_true', 
                        help='跳过对象列表统计(适用于大型 bucket,可显著加快分析速度)')
+    parser.add_argument('--debug-permanent-deletion', action='store_true',
+                       help='调试模式：测试永久删除分析逻辑（不需要真实bucket）')
+    parser.add_argument('--verify-only', action='store_true',
+                       help='仅执行删除标记统计验证（快速验证模式）')
     
     args = parser.parse_args()
     
     try:
-        analyzer = S3DeletionAnalyzer(args.bucket, args.region, args.skip_listing)
+        if args.debug_permanent_deletion:
+            # 调试模式：测试永久删除分析逻辑
+            analyzer = S3DeletionAnalyzer('test-bucket', args.region, True, args.days)
+            # 模拟CloudWatch数据显示删除
+            analyzer.count_data = [
+                {'Average': 100000, 'Timestamp': datetime.now(timezone.utc) - timedelta(days=2)},
+                {'Average': 95000, 'Timestamp': datetime.now(timezone.utc) - timedelta(days=1)},  # 删除了5000个对象
+                {'Average': 90000, 'Timestamp': datetime.now(timezone.utc)}  # 又删除了5000个对象
+            ]
+            # 模拟版本控制数据（无删除标记）
+            analyzer.version_analysis = {
+                'total_delete_markers': 0,
+                'total_noncurrent_objects': 0
+            }
+            # 只运行永久删除分析
+            analyzer._analyze_permanent_deletion()
+            print("\n调试模式完成！查看上面的分析结果。")
+            return 0
+        
+        if args.verify_only:
+            # 仅验证模式：只执行删除标记统计验证
+            print(f"\n{'='*80}")
+            print(f"删除标记统计验证模式")
+            print(f"Bucket: {args.bucket}")
+            print(f"{'='*80}\n")
+            
+            analyzer = S3DeletionAnalyzer(args.bucket, args.region, args.skip_listing, args.days)
+            
+            # 先快速获取版本控制状态
+            try:
+                versioning = analyzer.s3_client.get_bucket_versioning(Bucket=args.bucket)
+                if versioning.get('Status') != 'Enabled':
+                    print("⚠️ 版本控制未启用，无删除标记可验证。")
+                    return 0
+            except Exception as e:
+                print(f"❌ 无法检查版本控制状态: {e}")
+                return 1
+            
+            # 标记这是仅验证模式，没有原始统计可对比
+            analyzer.version_analysis = {'total_delete_markers': 0, 'total_noncurrent_objects': 0, 'verify_only_mode': True}
+            
+            # 执行验证
+            analyzer._verify_deletion_marker_count()
+            
+            # 显示结果
+            if hasattr(analyzer, 'verification_result'):
+                vr = analyzer.verification_result
+                print(f"\n{'='*80}")
+                print("验证结果汇总")
+                print(f"{'='*80}")
+                print(f"验证方法: {'采样验证' if vr['sample_verification'] else '完整验证'}")
+                print(f"删除标记数量: {vr['delete_markers_count']:,}")
+                print(f"结论: {vr['verification_conclusion']}")
+                print(f"统计可信度: {vr['confidence_in_stats']}")
+                
+                if vr['delete_markers_count'] > 0:
+                    print(f"\n🎉 发现 {vr['delete_markers_count']:,} 个删除标记！")
+                    print("这说明之前的统计可能有遗漏，对象是被软删除的，可以恢复！")
+                else:
+                    print(f"\n✅ 确认没有删除标记")
+                    print("这支持永久删除的结论。")
+            
+            return 0
+        
+        analyzer = S3DeletionAnalyzer(args.bucket, args.region, args.skip_listing, args.days)
         analyzer.analyze()
     except Exception as e:
         print(f"\n错误: {str(e)}\n")

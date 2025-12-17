@@ -24,6 +24,7 @@ show_help() {
     echo ""
     echo "可选参数:"
     echo "  --region REGION      AWS 区域 (默认: us-east-1)"
+    echo "  --days DAYS          分析天数 (默认: 90天)"
     echo "  --skip-listing       跳过对象列表统计 (加快分析速度)"
     echo "  --background, -b     后台运行"
     echo "  -h, --help           显示此帮助信息"
@@ -38,11 +39,14 @@ show_help() {
     echo "  ${YELLOW}# 指定区域${NC}"
     echo "  ./analyze.sh my-bucket --region ap-southeast-1"
     echo ""
+    echo "  ${YELLOW}# 指定分析天数${NC}"
+    echo "  ./analyze.sh my-bucket --days 180"
+    echo ""
     echo "  ${YELLOW}# 跳过对象列表 (大型 bucket 推荐)${NC}"
     echo "  ./analyze.sh my-bucket --skip-listing"
     echo ""
     echo "  ${YELLOW}# 组合使用${NC}"
-    echo "  ./analyze.sh my-bucket --region us-west-2 --skip-listing --background"
+    echo "  ./analyze.sh my-bucket --region us-west-2 --days 365 --skip-listing --background"
     echo ""
     echo "输出:"
     echo "  - 报告保存在 logs/ 目录"
@@ -74,20 +78,48 @@ if [ ! -f "$ANALYZER_SCRIPT" ]; then
     exit 1
 fi
 
-# 检查是否后台运行
+# 解析参数
 BACKGROUND=false
 BUCKET_NAME=""
 ARGS=()
+i=1
 
-for arg in "$@"; do
-    if [ "$arg" == "--background" ] || [ "$arg" == "-b" ]; then
-        BACKGROUND=true
-    elif [ -z "$BUCKET_NAME" ] && [[ ! "$arg" =~ ^-- ]]; then
-        BUCKET_NAME="$arg"
-        ARGS+=("--bucket" "$arg")
-    else
-        ARGS+=("$arg")
-    fi
+while [ $i -le $# ]; do
+    arg="${!i}"
+    
+    case "$arg" in
+        --background|-b)
+            BACKGROUND=true
+            ;;
+        --region)
+            i=$((i + 1))
+            if [ $i -le $# ]; then
+                ARGS+=("--region" "${!i}")
+            fi
+            ;;
+        --days)
+            i=$((i + 1))
+            if [ $i -le $# ]; then
+                ARGS+=("--days" "${!i}")
+            fi
+            ;;
+        --skip-listing)
+            ARGS+=("--skip-listing")
+            ;;
+        --*)
+            # 其他选项直接传递
+            ARGS+=("$arg")
+            ;;
+        *)
+            # 第一个非选项参数作为 bucket 名称
+            if [ -z "$BUCKET_NAME" ]; then
+                BUCKET_NAME="$arg"
+                ARGS+=("--bucket" "$arg")
+            fi
+            ;;
+    esac
+    
+    i=$((i + 1))
 done
 
 # 执行分析
